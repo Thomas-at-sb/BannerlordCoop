@@ -618,6 +618,47 @@ public sealed class HideoutMissionRuntimeTests : MissionTestEnvironment
         }, DuelShimmedMethods));
     }
 
+    [Fact]
+    public void HostLeavingDuringTheConversation_IsNotReportedAsADeclinedDuel()
+    {
+        using var fixture = new MissionEngineFixture();
+        RunWithDuelShims(() => Clients.First().Call(() =>
+        {
+            var mission = fixture.CreateMission(Clients.First());
+            var attackers = mission.AddTeam(BattleSideEnum.Attacker);
+            var defenders = mission.AddTeam(BattleSideEnum.Defender);
+            mission.PlayerTeam = mission.AttackerTeam;
+            SpawnHuman(mission, attackers, AgentControllerType.AI, 1);
+            SpawnHuman(mission, defenders, AgentControllerType.AI, 2);
+            mission.MainAgent = SpawnHuman(mission, attackers, AgentControllerType.Player, 3);
+            var broker = Clients.First().Resolve<IMessageBroker>();
+            var session = new Mock<IBattleSession>();
+            session.SetupGet(value => value.HasInstance).Returns(true);
+            session.SetupGet(value => value.InstanceId).Returns("raid");
+            session.SetupGet(value => value.HostEpoch).Returns(1);
+            session.SetupGet(value => value.HostControllerId).Returns("host");
+            var logic = CreateDuelLogic(mission, broker, authority: false, session.Object);
+            logic.Native = new PromotionController(() => { });
+            try
+            {
+                broker.Publish(this, DuelState(1, HideoutPhase.Conversation, BattleSideEnum.None));
+                logic.OnMissionTick(0.1f);
+
+                // The successor is elected a tick before its first phase snapshot arrives.
+                session.SetupGet(value => value.HostEpoch).Returns(2);
+                session.SetupGet(value => value.HostControllerId).Returns("successor");
+                logic.OnMissionTick(0.1f);
+                broker.Publish(this, new NetworkHideoutState("raid", "successor", 2, 1, HideoutPhase.BossBattle, 2, 1,
+                    Array.Empty<int>(), BattleSideEnum.None, 25));
+                logic.OnMissionTick(0.1f);
+
+                Assert.Equal(HideoutPhase.BossBattle, logic.Native.Phase);
+                Assert.Empty(duelNotices);
+            }
+            finally { logic.OnRemoveBehavior(); }
+        }, DuelShimmedMethods));
+    }
+
     [Theory]
     [InlineData((int)HideoutPhase.Conversation, (int)HideoutPhase.Duel, BattleSideEnum.None, false, true, 1)]
     [InlineData((int)HideoutPhase.Conversation, (int)HideoutPhase.BossBattle, BattleSideEnum.None, false, true, 2)]
@@ -679,7 +720,8 @@ public sealed class HideoutMissionRuntimeTests : MissionTestEnvironment
         => mission.SpawnAgent(new AgentBuildData(Game.Current.PlayerTroop).Team(team).Controller(controller)
             .TroopOrigin(Mock.Of<IAgentOriginBase>(origin => origin.UniqueSeed == seed)));
 
-    private static CoopHideoutMissionLogic CreateDuelLogic(MockMission mission, IMessageBroker broker, bool authority)
+    private static CoopHideoutMissionLogic CreateDuelLogic(MockMission mission, IMessageBroker broker, bool authority,
+        IBattleSession session = null)
     {
         var attacker = new CoopTroopSupplier("raid", BattleSideEnum.Attacker, null, null);
         var defender = new CoopTroopSupplier("raid", BattleSideEnum.Defender, null, null);
@@ -687,7 +729,7 @@ public sealed class HideoutMissionRuntimeTests : MissionTestEnvironment
         defender.SetReserve(Array.Empty<PartyReserve>(), 0, 0, 1000);
         var logic = new CoopHideoutMissionLogic(Mock.Of<IBattleNetwork>(), broker,
             Mock.Of<IMissionContext>(), defender, attacker, false);
-        AttachHideoutLogic(logic, mission, Mock.Of<IBattleSession>(value => value.HasInstance &&
+        AttachHideoutLogic(logic, mission, session ?? Mock.Of<IBattleSession>(value => value.HasInstance &&
             value.IsLocalHost == authority && value.HostEpoch == 1 && value.InstanceId == "raid" && value.HostControllerId == "host"));
         AccessTools.Field(typeof(CoopHideoutMissionLogic), "initialized").SetValue(logic, true);
         AccessTools.Field(typeof(CoopHideoutMissionLogic), "authorityEpoch").SetValue(logic, authority ? 1 : 0);

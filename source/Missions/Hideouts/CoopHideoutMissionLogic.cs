@@ -426,11 +426,12 @@ internal sealed class CoopHideoutMissionLogic : MissionLogic
     private void ObservePhase()
     {
         var previous = seenPhase;
-        bool sameHost = seenEpoch == battle.Session.HostEpoch;
         seenPhase = Native.Phase;
-        seenEpoch = battle.Session.HostEpoch;
         if (previous == seenPhase) return;
 
+        // The epoch belongs to the phase it was first seen in, so a host change inside one phase still counts.
+        bool sameHost = seenEpoch == battle.Session.HostEpoch;
+        seenEpoch = battle.Session.HostEpoch;
         Logger.Information("[Hideout] Phase {Previous} to {Phase}, winner {Winner}, authority {Authority}, host epoch {Epoch}",
             previous, seenPhase, winner, IsAuthority, seenEpoch);
         duelLost |= IsLostDuel(previous, seenPhase, winner);
