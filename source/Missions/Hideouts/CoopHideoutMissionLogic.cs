@@ -1,4 +1,5 @@
 ﻿using Common;
+using Common.Logging;
 using Common.Messaging;
 using GameInterface.Registry.Auto;
 using GameInterface.Services.MapEvents.TroopSupply;
@@ -6,6 +7,7 @@ using Missions.Battles;
 using Missions.Services.Network;
 using Missions.Messages;
 using SandBox.Conversation.MissionLogics;
+using Serilog;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -13,12 +15,18 @@ using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.MapEvents;
 using TaleWorlds.Core;
 using TaleWorlds.Library;
+using TaleWorlds.Localization;
 using TaleWorlds.MountAndBlade;
 
 namespace Missions.Hideouts;
 
 internal sealed class CoopHideoutMissionLogic : MissionLogic
 {
+    internal const string DuelAcceptedNotice = "{NAME} accepted the bandit leader's duel. If the duel is lost, the attack fails for everyone.";
+    internal const string DuelDeclinedNotice = "{NAME} declined the duel. Everyone fights the bandit leader together.";
+    internal const string DuelLostNotice = "The duel was lost. The hideout attack has failed for everyone.";
+    private static readonly ILogger Logger = LogManager.GetLogger<CoopHideoutMissionLogic>();
+
     private readonly IBattleNetwork network;
     private readonly IMessageBroker broker;
     private readonly IMissionContext missionContext;
@@ -39,11 +47,14 @@ internal sealed class CoopHideoutMissionLogic : MissionLogic
     private bool heroEntered;
     private bool duelSurrenderSent;
     private bool recoveringAuthority;
+    private bool duelLost;
     private int authorityEpoch;
+    private int seenEpoch;
     private int speakerSeed;
     private long revision;
     private float snapshotTimer;
     private HideoutPhase lastPhase;
+    private HideoutPhase seenPhase;
     private BattleSideEnum winner = BattleSideEnum.None;
 
     public HideoutTroopSupplier Defender { get; }
@@ -166,6 +177,7 @@ internal sealed class CoopHideoutMissionLogic : MissionLogic
         {
             ApplyLatest();
         }
+        ObservePhase();
         ApplySpectators();
         if (!reportedSuccessorReady && HasPhaseSnapshot)
         {
@@ -388,7 +400,8 @@ internal sealed class CoopHideoutMissionLogic : MissionLogic
         bool duel = Native.Phase == HideoutPhase.Duel;
         if (!duel)
         {
-            RestoreSpectators();
+            // A lost duel decides the hideout for everyone, so nobody is handed back into the fight.
+            if (!duelLost) RestoreSpectators();
             return;
         }
 
@@ -408,6 +421,37 @@ internal sealed class CoopHideoutMissionLogic : MissionLogic
                 agent.Controller = AgentControllerType.None;
             }
         }
+    }
+
+    private void ObservePhase()
+    {
+        var previous = seenPhase;
+        bool sameHost = seenEpoch == battle.Session.HostEpoch;
+        seenPhase = Native.Phase;
+        seenEpoch = battle.Session.HostEpoch;
+        if (previous == seenPhase) return;
+
+        Logger.Information("[Hideout] Phase {Previous} to {Phase}, winner {Winner}, authority {Authority}, host epoch {Epoch}",
+            previous, seenPhase, winner, IsAuthority, seenEpoch);
+        duelLost |= IsLostDuel(previous, seenPhase, winner);
+        var notice = DuelNotice(previous, seenPhase, winner, IsAuthority, sameHost);
+        if (notice == null) return;
+
+        var speaker = Mission.Agents.FirstOrDefault(agent => agent.Origin?.UniqueSeed == speakerSeed);
+        MBInformationManager.AddQuickInformation(new TextObject(notice)
+            .SetTextVariable("NAME", speaker?.NameTextObject ?? new TextObject("The attack leader")));
+    }
+
+    internal static bool IsLostDuel(HideoutPhase previous, HideoutPhase phase, BattleSideEnum winner)
+        => previous == HideoutPhase.Duel && phase == HideoutPhase.Resolved && winner == BattleSideEnum.Defender;
+
+    // Peers only learn the host's conversation choice from the phase it leads to.
+    internal static string DuelNotice(HideoutPhase previous, HideoutPhase phase, BattleSideEnum winner, bool authority, bool sameHost)
+    {
+        if (IsLostDuel(previous, phase, winner)) return DuelLostNotice;
+        if (authority || previous != HideoutPhase.Conversation) return null;
+        if (phase == HideoutPhase.Duel) return DuelAcceptedNotice;
+        return phase == HideoutPhase.BossBattle && sameHost ? DuelDeclinedNotice : null;
     }
 
     public void RestoreSpectators()

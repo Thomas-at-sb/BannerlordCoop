@@ -13,6 +13,7 @@ using SandBox.Missions.MissionLogics;
 using SandBox.Missions;
 using SandBox.Objects.AreaMarkers;
 using SandBox.Objects.Usables;
+using System.Reflection;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.MapEvents;
 using TaleWorlds.CampaignSystem.Party;
@@ -536,12 +537,176 @@ public sealed class HideoutMissionRuntimeTests : MissionTestEnvironment
         }));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void DuelResult_HostKeepsWatchersOutAfterALossAndReturnsThemAfterAWin(bool lost)
+    {
+        using var fixture = new MissionEngineFixture();
+        RunWithDuelShims(() => Clients.First().Call(() =>
+        {
+            var mission = fixture.CreateMission(Clients.First());
+            var attackers = mission.AddTeam(BattleSideEnum.Attacker);
+            var defenders = mission.AddTeam(BattleSideEnum.Defender);
+            mission.PlayerTeam = mission.AttackerTeam;
+            var duelist = SpawnHuman(mission, attackers, AgentControllerType.Player, 1);
+            var boss = SpawnHuman(mission, defenders, AgentControllerType.AI, 2);
+            var watcher = SpawnHuman(mission, attackers, AgentControllerType.AI, 3);
+            mission.MainAgent = duelist;
+            var logic = CreateDuelLogic(mission, Clients.First().Resolve<IMessageBroker>(), authority: true);
+            var native = new PromotionController(() => { }) { Boss = boss };
+            logic.Native = native;
+            AccessTools.Field(typeof(CoopHideoutMissionLogic), "lastPhase").SetValue(logic, HideoutPhase.Duel);
+            AccessTools.Field(typeof(CoopHideoutMissionLogic), "snapshotTimer").SetValue(logic, 100f);
+            try
+            {
+                logic.OnMissionTick(0.1f);
+                Assert.Same(Team.Invalid, watcher.Team);
+                Assert.Equal(AgentControllerType.None, watcher.Controller);
+
+                // Native resolves the duel after the coop tick recorded its winner.
+                native.Apply(HideoutPhase.Resolved, boss, 0);
+                AccessTools.Field(typeof(CoopHideoutMissionLogic), "winner")
+                    .SetValue(logic, lost ? BattleSideEnum.Defender : BattleSideEnum.Attacker);
+                AccessTools.Field(typeof(CoopHideoutMissionLogic), "lastPhase").SetValue(logic, HideoutPhase.Resolved);
+                logic.OnMissionTick(0.1f);
+
+                Assert.Same(lost ? Team.Invalid : attackers, watcher.Team);
+                Assert.Equal(lost ? AgentControllerType.None : AgentControllerType.AI, watcher.Controller);
+                Assert.Equal(lost ? new[] { CoopHideoutMissionLogic.DuelLostNotice } : Array.Empty<string>(), duelNotices.Select(notice => notice.Value));
+            }
+            finally { logic.OnRemoveBehavior(); }
+        }, DuelShimmedMethods));
+    }
+
+    [Fact]
+    public void LostDuel_PeerHearsOfTheDuelAndIsNotHandedBackIntoTheFight()
+    {
+        using var fixture = new MissionEngineFixture();
+        RunWithDuelShims(() => Clients.First().Call(() =>
+        {
+            var mission = fixture.CreateMission(Clients.First());
+            var attackers = mission.AddTeam(BattleSideEnum.Attacker);
+            var defenders = mission.AddTeam(BattleSideEnum.Defender);
+            mission.PlayerTeam = mission.AttackerTeam;
+            SpawnHuman(mission, attackers, AgentControllerType.AI, 1);
+            SpawnHuman(mission, defenders, AgentControllerType.AI, 2);
+            var player = SpawnHuman(mission, attackers, AgentControllerType.Player, 3);
+            mission.MainAgent = player;
+            var broker = Clients.First().Resolve<IMessageBroker>();
+            var logic = CreateDuelLogic(mission, broker, authority: false);
+            logic.Native = new PromotionController(() => { });
+            try
+            {
+                broker.Publish(this, DuelState(1, HideoutPhase.Conversation, BattleSideEnum.None));
+                logic.OnMissionTick(0.1f);
+                Assert.Empty(duelNotices);
+                broker.Publish(this, DuelState(2, HideoutPhase.Duel, BattleSideEnum.None));
+                logic.OnMissionTick(0.1f);
+                Assert.Same(Team.Invalid, player.Team);
+                Assert.Equal(AgentControllerType.None, player.Controller);
+
+                broker.Publish(this, DuelState(3, HideoutPhase.Resolved, BattleSideEnum.Defender));
+                logic.OnMissionTick(0.1f);
+                logic.OnMissionTick(0.1f);
+
+                Assert.Same(Team.Invalid, player.Team);
+                Assert.Equal(AgentControllerType.None, player.Controller);
+                Assert.Equal(new[] { CoopHideoutMissionLogic.DuelAcceptedNotice, CoopHideoutMissionLogic.DuelLostNotice }, duelNotices.Select(notice => notice.Value));
+            }
+            finally { logic.OnRemoveBehavior(); }
+        }, DuelShimmedMethods));
+    }
+
+    [Theory]
+    [InlineData((int)HideoutPhase.Conversation, (int)HideoutPhase.Duel, BattleSideEnum.None, false, true, 1)]
+    [InlineData((int)HideoutPhase.Conversation, (int)HideoutPhase.BossBattle, BattleSideEnum.None, false, true, 2)]
+    [InlineData((int)HideoutPhase.Duel, (int)HideoutPhase.Resolved, BattleSideEnum.Defender, false, true, 3)]
+    [InlineData((int)HideoutPhase.Duel, (int)HideoutPhase.Resolved, BattleSideEnum.Defender, true, true, 3)]
+    [InlineData((int)HideoutPhase.Conversation, (int)HideoutPhase.Duel, BattleSideEnum.None, true, true, 0)]
+    [InlineData((int)HideoutPhase.Conversation, (int)HideoutPhase.BossBattle, BattleSideEnum.None, true, true, 0)]
+    [InlineData((int)HideoutPhase.Conversation, (int)HideoutPhase.BossBattle, BattleSideEnum.None, false, false, 0)]
+    [InlineData((int)HideoutPhase.Waiting, (int)HideoutPhase.Duel, BattleSideEnum.None, false, true, 0)]
+    [InlineData((int)HideoutPhase.Duel, (int)HideoutPhase.Resolved, BattleSideEnum.Attacker, false, true, 0)]
+    [InlineData((int)HideoutPhase.Duel, (int)HideoutPhase.BossBattle, BattleSideEnum.None, false, false, 0)]
+    [InlineData((int)HideoutPhase.BossBattle, (int)HideoutPhase.Resolved, BattleSideEnum.Defender, false, true, 0)]
+    public void DuelNotice_FollowsOnlyTheHostsChoiceAndALostDuel(int previous, int phase, BattleSideEnum winner,
+        bool authority, bool sameHost, int expected)
+    {
+        var notices = new[] { null, CoopHideoutMissionLogic.DuelAcceptedNotice,
+            CoopHideoutMissionLogic.DuelDeclinedNotice, CoopHideoutMissionLogic.DuelLostNotice };
+        Assert.Equal(notices[expected],
+            CoopHideoutMissionLogic.DuelNotice((HideoutPhase)previous, (HideoutPhase)phase, winner, authority, sameHost));
+    }
+
+    private static readonly List<TextObject> duelNotices = new();
+
+    private static MethodBase[] DuelShimmedMethods => new MethodBase[]
+    {
+        AccessTools.Method(typeof(Team), nameof(Team.SetIsEnemyOf)),
+        AccessTools.Method(typeof(Mission), nameof(Mission.SetMissionMode)),
+        AccessTools.Method(typeof(MapEvent), nameof(MapEvent.SetOverrideWinner)),
+    };
+
+    private static void RunWithDuelShims(Action action)
+    {
+        var harmony = new Harmony($"hideout-duel.{Guid.NewGuid()}");
+        duelNotices.Clear();
+        try
+        {
+            harmony.Patch(AccessTools.Method(typeof(MBInformationManager), nameof(MBInformationManager.AddQuickInformation)),
+                prefix: new HarmonyMethod(typeof(HideoutMissionRuntimeTests), nameof(RecordDuelNotice)));
+            harmony.Patch(AccessTools.PropertyGetter(typeof(MapEvent), nameof(MapEvent.PlayerMapEvent)),
+                prefix: new HarmonyMethod(typeof(HideoutMissionRuntimeTests), nameof(DetachedPlayerMapEvent)));
+            RunWithSceneShims(action);
+        }
+        finally { harmony.UnpatchAll(harmony.Id); }
+    }
+
+    private static bool RecordDuelNotice(TextObject message)
+    {
+        duelNotices.Add(message);
+        return false;
+    }
+
+    private static bool DetachedPlayerMapEvent(ref MapEvent __result)
+    {
+        __result = ObjectHelper.SkipConstructor<MapEvent>();
+        return false;
+    }
+
+    private static Agent SpawnHuman(MockMission mission, Team team, AgentControllerType controller, int seed)
+        => mission.SpawnAgent(new AgentBuildData(Game.Current.PlayerTroop).Team(team).Controller(controller)
+            .TroopOrigin(Mock.Of<IAgentOriginBase>(origin => origin.UniqueSeed == seed)));
+
+    private static CoopHideoutMissionLogic CreateDuelLogic(MockMission mission, IMessageBroker broker, bool authority)
+    {
+        var attacker = new CoopTroopSupplier("raid", BattleSideEnum.Attacker, null, null);
+        var defender = new CoopTroopSupplier("raid", BattleSideEnum.Defender, null, null);
+        attacker.SetReserve(Array.Empty<PartyReserve>(), 0, 0, 1000);
+        defender.SetReserve(Array.Empty<PartyReserve>(), 0, 0, 1000);
+        var logic = new CoopHideoutMissionLogic(Mock.Of<IBattleNetwork>(), broker,
+            Mock.Of<IMissionContext>(), defender, attacker, false);
+        AttachHideoutLogic(logic, mission, Mock.Of<IBattleSession>(value => value.HasInstance &&
+            value.IsLocalHost == authority && value.HostEpoch == 1 && value.InstanceId == "raid" && value.HostControllerId == "host"));
+        AccessTools.Field(typeof(CoopHideoutMissionLogic), "initialized").SetValue(logic, true);
+        AccessTools.Field(typeof(CoopHideoutMissionLogic), "authorityEpoch").SetValue(logic, authority ? 1 : 0);
+        AccessTools.Field(typeof(CoopHideoutMissionLogic), "reportedSuccessorReady").SetValue(logic, true);
+        var end = new BattleEndLogic();
+        AccessTools.Property(typeof(MissionBehavior), nameof(MissionBehavior.Mission)).SetValue(end, mission.Shell);
+        mission.Shell.MissionBehaviors.Add(end);
+        return logic;
+    }
+
+    private static NetworkHideoutState DuelState(long revision, HideoutPhase phase, BattleSideEnum winner)
+        => new("raid", "host", 1, revision, phase, 2, 1, Array.Empty<int>(), winner, 25);
+
     private sealed class PromotionController : ICoopHideoutNativeController
     {
         private readonly Action onResume;
         public PromotionController(Action onResume) => this.onResume = onResume;
         public HideoutPhase Phase { get; private set; } = HideoutPhase.Duel;
-        public Agent Boss => null;
+        public Agent Boss { get; set; }
         public bool Resumed { get; private set; }
         public void Initialize(bool authority, bool migration) { }
         public void TickAuthority(float dt) { }
